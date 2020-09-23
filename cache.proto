@@ -1,0 +1,12 @@
+syntax = "proto3";
+option go_package = ".;cache";
+
+message Data {
+    bytes value = 1;
+}
+
+message Void {}
+
+service Cache {
+    rpc GetRandomDataStream(Void) returns (stream Data) {}
+}

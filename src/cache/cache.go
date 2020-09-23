@@ -114,6 +114,7 @@ func getData(url string, rdb *redis.Client, out chan<- []byte, dataReadySubscrib
 	result, err := getDataFromCache(url, rdb)
 	if err != nil {
 		getData(url, rdb, out, dataReadySubscribe, config)
+		return
 	}
 	switch result.status {
 	case ready:
@@ -126,8 +127,9 @@ func getData(url string, rdb *redis.Client, out chan<- []byte, dataReadySubscrib
 			publishReady(url, rdb)
 		}()
 	case fetching:
-		fmt.Println("Waiting someone fetching", url)
+		//fmt.Println("Waiting someone fetching", url)
 		<-dataReady
+		//fmt.Println("Done someone fetching", url)
 		getData(url, rdb, out, dataReadySubscribe, config)
 	}
 }
@@ -149,7 +151,7 @@ func getDataFromCache(url string, rdb *redis.Client) (result *cacheResult, err e
 	key := "cache:" + url
 	err = rdb.Watch(ctx, func(tx *redis.Tx) error {
 		res, err := tx.HGetAll(ctx, key).Result()
-		if err != nil {
+		if err != nil && err != redis.Nil {
 			return err
 		}
 		switch res["status"] {
@@ -163,12 +165,17 @@ func getDataFromCache(url string, rdb *redis.Client) (result *cacheResult, err e
 				status: fetching,
 			}
 		default:
-			tx.HSet(ctx, key, "status", "fetching")
-			result = &cacheResult{
-				status: fetch,
+			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+				pipe.HSet(ctx, key, "status", "fetching")
+				return nil
+			})
+			if err == nil {
+				result = &cacheResult{
+					status: fetch,
+				}
 			}
 		}
-		return nil
+		return err
 	}, key)
 	return
 }
@@ -177,11 +184,13 @@ func fetchUrl(url string) []byte {
 	log.Printf("fetching %q...", url)
 	res, err := http.Get(url)
 	if err != nil {
+		log.Printf("Error fetching %q: %v", url, err)
 		return nil
 	}
 	data, err := ioutil.ReadAll(res.Body)
 	res.Body.Close()
 	if err != nil {
+		log.Printf("Error reading body for %q: %v", url, err)
 		return nil
 	}
 	log.Printf("fetched %q.", url)

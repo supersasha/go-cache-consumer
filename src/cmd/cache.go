@@ -1,6 +1,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"io/ioutil"
 	"log"
@@ -13,17 +14,25 @@ import (
 )
 
 func main() {
-	config := &cache.Config{}
-	data, _ := ioutil.ReadFile("./config.yml")
-	fmt.Printf("data: %s", data)
+	configPath := flag.String("c", "./config.yml", "path to config")
+	port := flag.String("p", "8511", "listen port")
+	flag.Parse()
 
-	err := yaml.Unmarshal(data, config)
+	config := cache.DefaultConfig()
+	data, err := ioutil.ReadFile(*configPath)
+	if err != nil {
+		log.Fatalf("reading config: %v", err)
+	}
+
+	err = yaml.Unmarshal(data, config)
 	if err != nil {
 		log.Fatalf("failed to parse config: %v", err)
 	}
-	fmt.Println("config:", config)
 
-	lis, err := net.Listen("tcp", ":8511")
+	cfg, _ := yaml.Marshal(config)
+	fmt.Println(string(cfg))
+
+	lis, err := net.Listen("tcp", ":"+*port)
 	if err != nil {
 		log.Fatalf("failed to listen: %v", err)
 	}

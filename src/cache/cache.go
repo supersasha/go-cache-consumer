@@ -9,7 +9,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/go-redis/redis/v8"
+	"github.com/gomodule/redigo/redis"
 )
 
 var ctx = context.Background()
@@ -19,41 +19,82 @@ type Config struct {
 	MinTimeout       int      `yaml:"MinTimeout"`
 	MaxTimeout       int      `yaml:"MaxTimeout"`
 	NumberOfRequests int      `yaml:"NumberOfRequests"`
+	ErrorTimeout     int      `yaml:"ErrorTimeout"`
+	RedisHostport    string   `yaml:"RedisHostport"`
+}
+
+func DefaultConfig() *Config {
+	return &Config{
+		NumberOfRequests: 1,
+		MinTimeout:       300,
+		MaxTimeout:       600,
+		ErrorTimeout:     30,
+		RedisHostport:    "127.0.0.1:6379",
+	}
 }
 
 type Cache struct {
-	config *Config
-	rdbs   []*redis.Client
-	rdbSub *redis.Client
-	subCh  chan dataReadySubscription
+	config    *Config
+	redisPool *redis.Pool
+	subConn   redis.Conn
+	subCh     chan dataReadySubscription
 }
 
 func NewCache(config *Config) *Cache {
-	fmt.Println("Config: ", config)
-	rdbs := make([]*redis.Client, config.NumberOfRequests)
-	for i := 0; i < config.NumberOfRequests; i++ {
-		rdbs[i] = redis.NewClient(&redis.Options{
-			Addr: "127.0.0.1:6379",
-		})
-	}
-	rdbSub := redis.NewClient(&redis.Options{
-		Addr: "127.0.0.1:6379",
-	})
 	subCh := make(chan dataReadySubscription)
-	go subscribeReady(rdbSub, subCh)
+	redisPool := &redis.Pool{
+		Dial: func() (redis.Conn, error) {
+			return redis.Dial("tcp", config.RedisHostport)
+		},
+		MaxActive: 100,
+		Wait:      true,
+	}
+	subConn, err := redis.Dial("tcp", config.RedisHostport)
+	if err != nil {
+		log.Fatalf("establishing connection to Redis: %v", err)
+	}
+	go subscribeReady(subConn, subCh)
 	return &Cache{
-		config: config,
-		rdbs:   rdbs,
-		rdbSub: rdbSub,
-		subCh:  subCh,
+		config:    config,
+		redisPool: redisPool,
+		subConn:   subConn,
+		subCh:     subCh,
 	}
 }
 
-func subscribeReady(rdb *redis.Client, subscriptions <-chan dataReadySubscription) {
-	pubsub := rdb.Subscribe(ctx, "cache:ready")
-	defer pubsub.Close()
-	pubsub.Receive(ctx)
-	ch := pubsub.Channel()
+func (c *Cache) GetRandomDataStream(_ *Void, stream Cache_GetRandomDataStreamServer) error {
+	ch := make(chan []byte)
+	for i := 0; i < c.config.NumberOfRequests; i++ {
+		url := c.config.URLs[rand.Intn(len(c.config.URLs))]
+		go getData(url, c.redisPool, ch, c.subCh, c.config, 3)
+	}
+	for i := 0; i < c.config.NumberOfRequests; i++ {
+		data := <-ch
+		if err := stream.Send(&Data{Value: data}); err != nil {
+			log.Printf("sending data: %v", err)
+		}
+	}
+	return nil
+}
+
+func listenReadyMessages(c redis.Conn, messages chan<- string) {
+	conn := redis.PubSubConn{Conn: c}
+	defer conn.Close()
+
+	conn.Subscribe("cache:ready")
+	for {
+		switch v := conn.Receive().(type) {
+		case redis.Message:
+			messages <- string(v.Data)
+		default:
+			// do nothing
+		}
+	}
+}
+
+func subscribeReady(conn redis.Conn, subscriptions <-chan dataReadySubscription) {
+	messages := make(chan string)
+	go listenReadyMessages(conn, messages)
 
 	subscribers := make(map[string][]chan struct{})
 
@@ -61,8 +102,7 @@ func subscribeReady(rdb *redis.Client, subscriptions <-chan dataReadySubscriptio
 		select {
 		case sub := <-subscriptions:
 			subscribers[sub.url] = append(subscribers[sub.url], sub.signal)
-		case msg := <-ch:
-			url := msg.Payload
+		case url := <-messages:
 			ss := subscribers[url]
 			for _, s := range ss {
 				close(s)
@@ -72,30 +112,13 @@ func subscribeReady(rdb *redis.Client, subscriptions <-chan dataReadySubscriptio
 	}
 }
 
-func (c *Cache) GetRandomDataStream(_ *Void, stream Cache_GetRandomDataStreamServer) error {
-	ch := make(chan []byte)
-	for i := 0; i < c.config.NumberOfRequests; i++ {
-		url := c.config.URLs[rand.Intn(len(c.config.URLs))]
-		go getData(url, c.rdbs[i], ch, c.subCh, c.config)
-	}
-	for i := 0; i < c.config.NumberOfRequests; i++ {
-		data := <-ch
-		if data == nil {
-			continue
-		}
-		if err := stream.Send(&Data{Value: data}); err != nil {
-			log.Printf("sending data: %v", err)
-		}
-	}
-	return nil
-}
-
 type cacheStatus int
 
 const (
 	ready cacheStatus = iota
 	fetching
 	fetch
+	fetcherr
 )
 
 type cacheResult struct {
@@ -108,12 +131,15 @@ type dataReadySubscription struct {
 	signal chan struct{}
 }
 
-func getData(url string, rdb *redis.Client, out chan<- []byte, dataReadySubscribe chan<- dataReadySubscription, config *Config) {
+func getData(url string, pool *redis.Pool, out chan<- []byte, dataReadySubscribe chan<- dataReadySubscription, config *Config, attempts int) {
+	if attempts == 0 {
+		return
+	}
 	dataReady := make(chan struct{}, 1)
 	dataReadySubscribe <- dataReadySubscription{url: url, signal: dataReady}
-	result, err := getDataFromCache(url, rdb)
+	result, err := getDataFromCache(url, pool)
 	if err != nil {
-		getData(url, rdb, out, dataReadySubscribe, config)
+		getData(url, pool, out, dataReadySubscribe, config, attempts-1)
 		return
 	}
 	switch result.status {
@@ -121,68 +147,104 @@ func getData(url string, rdb *redis.Client, out chan<- []byte, dataReadySubscrib
 		out <- result.data
 	case fetch:
 		data := fetchUrl(url)
-		out <- data
-		go func() {
-			putDataToCache(url, data, rdb, config)
-			publishReady(url, rdb)
-		}()
+		if data != nil {
+			out <- data
+			go func() {
+				putDataToCache(url, data, pool, config)
+				publishReady(url, pool)
+			}()
+		} else {
+			out <- data
+			putErrorToCache(url, pool, config)
+			publishReady(url, pool)
+		}
 	case fetching:
-		//fmt.Println("Waiting someone fetching", url)
 		<-dataReady
-		//fmt.Println("Done someone fetching", url)
-		getData(url, rdb, out, dataReadySubscribe, config)
+		getData(url, pool, out, dataReadySubscribe, config, attempts-1)
+	case fetcherr:
+		out <- nil
 	}
 }
 
-func publishReady(url string, rdb *redis.Client) {
-	rdb.Publish(ctx, "cache:ready", url)
+func publishReady(url string, pool *redis.Pool) {
+	conn := pool.Get()
+	defer conn.Close()
+	conn.Do("PUBLISH", "cache:ready", url)
 }
 
-func putDataToCache(url string, data []byte, rdb *redis.Client, config *Config) {
+func putErrorToCache(url string, pool *redis.Pool, config *Config) {
+	conn := pool.Get()
+	defer conn.Close()
 	key := "cache:" + url
-	rdb.HSet(ctx, key, "data", data)
-	rdb.HSet(ctx, key, "status", "ready")
-	seconds := rand.Intn(config.MaxTimeout-config.MinTimeout) + config.MinTimeout
-	ttl := time.Duration(seconds) * time.Second
-	rdb.Expire(ctx, key, ttl)
+	conn.Do("HSET", key, "data", "")
+	conn.Do("HSET", key, "status", "fetcherr")
+	conn.Do("EXPIRE", key, config.ErrorTimeout)
 }
 
-func getDataFromCache(url string, rdb *redis.Client) (result *cacheResult, err error) {
+func putDataToCache(url string, data []byte, pool *redis.Pool, config *Config) {
+	conn := pool.Get()
+	defer conn.Close()
 	key := "cache:" + url
-	err = rdb.Watch(ctx, func(tx *redis.Tx) error {
-		res, err := tx.HGetAll(ctx, key).Result()
-		if err != nil && err != redis.Nil {
-			return err
+	conn.Do("HSET", key, "data", data)
+	conn.Do("HSET", key, "status", "ready")
+	ttl := rand.Intn(config.MaxTimeout-config.MinTimeout) + config.MinTimeout
+	conn.Do("EXPIRE", key, ttl)
+}
+
+func getDataFromCache(url string, pool *redis.Pool) (result *cacheResult, err error) {
+	conn := pool.Get()
+	defer conn.Close()
+
+	key := "cache:" + url
+	_, err = conn.Do("WATCH", key)
+	if err != nil {
+		return nil, err
+	}
+
+	defer conn.Do("UNWATCH")
+	res, err := redis.StringMap(conn.Do("HGETALL", key))
+	if err != nil {
+		return nil, err
+	}
+	switch res["status"] {
+	case "ready":
+		result = &cacheResult{
+			data:   []byte(res["data"]),
+			status: ready,
 		}
-		switch res["status"] {
-		case "ready":
-			result = &cacheResult{
-				data:   []byte(res["data"]),
-				status: ready,
-			}
-		case "fetching":
-			result = &cacheResult{
-				status: fetching,
-			}
-		default:
-			_, err = tx.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-				pipe.HSet(ctx, key, "status", "fetching")
-				return nil
-			})
-			if err == nil {
-				result = &cacheResult{
-					status: fetch,
-				}
-			}
+	case "fetching":
+		result = &cacheResult{
+			status: fetching,
 		}
-		return err
-	}, key)
-	return
+	case "fetcherr":
+		result = &cacheResult{
+			status: fetcherr,
+		}
+	default:
+		if err := conn.Send("MULTI"); err != nil {
+			return nil, err
+		}
+		if err := conn.Send("HSET", key, "status", "fetching"); err != nil {
+			return nil, err
+		}
+		q, err := conn.Do("EXEC")
+		if err != nil {
+			return nil, err
+		}
+		if q == nil {
+			return nil, fmt.Errorf("transaction failed")
+		}
+		result = &cacheResult{
+			status: fetch,
+		}
+	}
+
+	return result, nil
 }
 
 func fetchUrl(url string) []byte {
-	log.Printf("fetching %q...", url)
-	res, err := http.Get(url)
+	client := &http.Client{Timeout: 5 * time.Second}
+	res, err := client.Get(url)
 	if err != nil {
 		log.Printf("Error fetching %q: %v", url, err)
 		return nil
@@ -193,6 +255,5 @@ func fetchUrl(url string) []byte {
 		log.Printf("Error reading body for %q: %v", url, err)
 		return nil
 	}
-	log.Printf("fetched %q.", url)
 	return data
 }

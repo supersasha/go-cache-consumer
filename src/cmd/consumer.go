@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -12,9 +13,10 @@ import (
 	"cache"
 )
 
-func call(wg *sync.WaitGroup) {
+func call(wg *sync.WaitGroup, hostport string) {
+
 	defer wg.Done()
-	conn, err := grpc.Dial("127.0.0.1:8511", grpc.WithInsecure())
+	conn, err := grpc.Dial(hostport, grpc.WithInsecure())
 	if err != nil {
 		log.Fatalf("failed to dial: %v", err)
 	}
@@ -39,11 +41,14 @@ func call(wg *sync.WaitGroup) {
 }
 
 func main() {
+	hostport := flag.String("s", "127.0.0.1:8511", "cache service host:port")
+	flag.Parse()
+
 	n := 1000
 	wg := &sync.WaitGroup{}
 	wg.Add(n)
 	for i := 0; i < n; i++ {
-		go call(wg)
+		go call(wg, *hostport)
 	}
 	wg.Wait()
 	fmt.Println()

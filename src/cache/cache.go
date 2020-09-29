@@ -133,11 +133,12 @@ type dataReadySubscription struct {
 
 func getData(url string, pool *redis.Pool, out chan<- []byte, dataReadySubscribe chan<- dataReadySubscription, config *Config, attempts int) {
 	if attempts == 0 {
+		out <- nil
 		return
 	}
 	dataReady := make(chan struct{}, 1)
 	dataReadySubscribe <- dataReadySubscription{url: url, signal: dataReady}
-	result, err := getDataFromCache(url, pool)
+	result, err := getDataFromCache(url, pool, config)
 	if err != nil {
 		getData(url, pool, out, dataReadySubscribe, config, attempts-1)
 		return
@@ -191,7 +192,7 @@ func putDataToCache(url string, data []byte, pool *redis.Pool, config *Config) {
 	conn.Do("EXPIRE", key, ttl)
 }
 
-func getDataFromCache(url string, pool *redis.Pool) (result *cacheResult, err error) {
+func getDataFromCache(url string, pool *redis.Pool, config *Config) (result *cacheResult, err error) {
 	conn := pool.Get()
 	defer conn.Close()
 
@@ -225,6 +226,9 @@ func getDataFromCache(url string, pool *redis.Pool) (result *cacheResult, err er
 			return nil, err
 		}
 		if err := conn.Send("HSET", key, "status", "fetching"); err != nil {
+			return nil, err
+		}
+		if err := conn.Send("EXPIRE", key, config.ErrorTimeout+1); err != nil {
 			return nil, err
 		}
 		q, err := conn.Do("EXEC")
